@@ -1,0 +1,102 @@
+{
+  "repo": "codex-lane",
+  "accent": "#8AB4FF",
+  "hero": {
+    "command": "./codex-lane --help | grep -o '^  codex-lane [^#]*'",
+    "output": [
+      {
+        "text": "  codex-lane start <name> <cwd> <brief-file> [--model MODEL]"
+      },
+      {
+        "text": "  codex-lane resume <name> <thread-id> <cwd> <brief-file> [--model MODEL]"
+      },
+      {
+        "text": "  codex-lane steer <name> <text | @file>",
+        "style": "accent"
+      },
+      {
+        "text": "  codex-lane interrupt <name>"
+      },
+      {
+        "text": "  codex-lane status [name]"
+      },
+      {
+        "text": "  codex-lane last <name>"
+      },
+      {
+        "text": "  codex-lane stop <name>"
+      },
+      {
+        "text": "  codex-lane watch [name...]"
+      }
+    ],
+    "value": "Steer a Codex agent in the middle of its turn."
+  },
+  "diagram": {
+    "direction": "TB",
+    "nodes": [
+      {
+        "id": "cli",
+        "label": "codex-lane",
+        "sublabel": "start, steer, stop"
+      },
+      {
+        "id": "sock",
+        "label": "<name>.sock",
+        "sublabel": "Unix socket"
+      },
+      {
+        "id": "sup",
+        "label": "Supervisor",
+        "sublabel": "forked process"
+      },
+      {
+        "id": "app",
+        "label": "codex app-server",
+        "sublabel": "stdio JSON-RPC"
+      },
+      {
+        "id": "files",
+        "label": "Lane files",
+        "sublabel": "state.json, log, last.md"
+      },
+      {
+        "id": "watch",
+        "label": "watch, status, last",
+        "sublabel": "read lane files"
+      }
+    ],
+    "edges": [
+      {
+        "from": "cli",
+        "to": "sock",
+        "label": "op"
+      },
+      {
+        "from": "sock",
+        "to": "sup"
+      },
+      {
+        "from": "sup",
+        "to": "app",
+        "label": "turn/steer"
+      },
+      {
+        "from": "sup",
+        "to": "files",
+        "label": "writes"
+      },
+      {
+        "from": "files",
+        "to": "watch",
+        "label": "reads"
+      }
+    ],
+    "primary": [
+      "cli",
+      "sock",
+      "sup",
+      "app"
+    ]
+  }
+}
