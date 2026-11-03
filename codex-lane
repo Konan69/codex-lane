@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""codex-lane: run a Codex agent as a long-lived, steerable lane.
+
+Why: `codex exec` cannot be steered mid-run, and `codex queue` only reaches the
+app-server daemon. This keeps one `codex app-server` (stdio JSON-RPC) per lane
+behind a supervisor that listens on a unix socket, so the orchestrator can
+steer the active turn (`turn/steer`) or start a follow-up turn when idle.
+
+  codex-lane start <name> <cwd> <brief-file> [--model MODEL]
+  codex-lane resume <name> <thread-id> <cwd> <brief-file> [--model MODEL]   # adopt an existing thread (e.g. a finished `codex exec` session) as a steerable lane
+  codex-lane steer <name> <text | @file>     # steer active turn, or follow-up turn if idle
+  codex-lane interrupt <name>
+  codex-lane status [name]
+  codex-lane last <name>                     # last agent message
+  codex-lane stop <name>
+  codex-lane watch [name...]                 # stream lane events
+
+Files: $CODEX_LANE_DIR/<name>.{sock,state.json,events.jsonl,log,last.md}
+Default directory: ~/.local/state/codex-lane
+
+Configuration (environment variables, read at startup):
+  CODEX_HOME          Codex config and auth directory (default: ~/.codex)
+  CODEX_LANE_DIR      Lane state and log directory (default above)
+  CODEX_LANE_MODEL    Default model (default: Codex configured model)
+  CODEX_LANE_SERVICE_TIER  Service tier (default: Codex configured tier)
+  CODEX_LANE_PREAMBLE Text prepended to the initial brief (default: empty)
+--model MODEL overrides CODEX_LANE_MODEL.
+Requires Python 3.9+, Linux (/proc, fork, Unix sockets), git and codex on PATH.
+Lanes run with full filesystem access and approvalPolicy=never.
+"""
+import json, os, socket, subprocess, sys, threading, time
+
+HOME = os.path.expanduser("~")
+DIR = os.path.expanduser(os.environ.get("CODEX_LANE_DIR", os.path.join(HOME, ".local/state/codex-lane")))
+CODEX_HOME = os.path.expanduser(os.environ.get("CODEX_HOME", os.path.join(HOME, ".codex")))
+DEFAULT_MODEL = os.environ.get("CODEX_LANE_MODEL") or None
+SERVICE_TIER = os.environ.get("CODEX_LANE_SERVICE_TIER")
+PREAMBLE = os.environ.get("CODEX_LANE_PREAMBLE", "")
+
+
+def paths(name):
+    b = os.path.join(DIR, name)
+    return {k: f"{b}.{k}" for k in ("sock", "state.json", "events.jsonl", "log")} | {"last": f"{b}.last.md"}
+
+
+def read_state(name):
+    try:
+        with open(paths(name)["state.json"]) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def worktree_age(cwd):
+    """Seconds-ago of the newest change git can see in the lane's worktree."""
+    if not cwd or not os.path.isdir(cwd):
+        return "?"
+    try:
+        out = subprocess.run(["git", "-C", cwd, "status", "--porcelain", "-uall"],
+                             capture_output=True, text=True, timeout=20).stdout
+        files = [line[3:].split(" -> ")[-1] for line in out.splitlines()]
+        times = [os.path.getmtime(os.path.join(cwd, f)) for f in files if os.path.exists(os.path.join(cwd, f))]
+        head = subprocess.run(["git", "-C", cwd, "log", "-1", "--format=%ct"],
+                              capture_output=True, text=True, timeout=20).stdout.strip()
+        if head:
+            times.append(float(head))
+        return f"{int(time.time() - max(times))}s ago" if times else "never"
+    except Exception as e:
+        return f"?({e.__class__.__name__})"
+
+
+def text_input(text):
+    return [{"type": "text", "text": text, "text_elements": []}]
+
+
+class Supervisor:
+    """Owns one app-server process, one thread, and the control socket."""
+
+    def __init__(self, name, cwd, brief, model, resume_thread=None):
+        self.name, self.cwd, self.brief, self.model = name, cwd, brief, model
+        self.resume_thread = resume_thread
+        self.p = paths(name)
+        self.next_id = 0
+        self.pending = {}
+        self.lock = threading.Lock()
+        self.save_lock = threading.Lock()
+        self.state = {"name": name, "cwd": cwd, "model": model, "pid": os.getpid(),
+                      "thread_id": None, "turn_id": None, "status": "starting",
+                      "turns": 0, "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        env = dict(os.environ, CODEX_HOME=CODEX_HOME)
+        command = ["codex", "app-server"]
+        if SERVICE_TIER:
+            command += ["-c", "service_tier=" + json.dumps(SERVICE_TIER)]
+        self.proc = subprocess.Popen(command, cwd=cwd, env=env,
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=open(self.p["log"] + ".stderr", "a"), text=True, bufsize=1)
+        self.events = open(self.p["events.jsonl"], "a")
+        self.log = open(self.p["log"], "a")
+        self.agent_text = ""
+
+    def save(self):
+        # Called from the reader thread and the main thread. Unlocked, both
+        # wrote the same tmp path and the loser's os.replace raised
+        # FileNotFoundError: in the reader that froze status at "starting" for
+        # the lane's whole life; in run() it killed the supervisor at launch.
+        with self.save_lock:
+            tmp = f"{self.p['state.json']}.{threading.get_ident()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.state, f, indent=1)
+            os.replace(tmp, self.p["state.json"])
+
+    def note(self, line):
+        self.log.write(f"[{time.strftime('%H:%M:%S')}] {line}\n")
+        self.log.flush()
+
+    def send(self, method, params, notify=False):
+        msg = {"jsonrpc": "2.0", "method": method, "params": params}
+        waiter = None
+        if not notify:
+            with self.lock:
+                self.next_id += 1
+                msg["id"] = self.next_id
+                waiter = self.pending[self.next_id] = {"ev": threading.Event(), "resp": None}
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+        if waiter:
+            waiter["ev"].wait(120)
+            resp = waiter["resp"]
+            if resp is None or "error" in resp:
+                raise RuntimeError(f"{method} failed: {resp}")
+            return resp["result"]
+
+    def reader(self):
+        for raw in self.proc.stdout:
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if "id" in msg and ("result" in msg or "error" in msg) and "method" not in msg:
+                w = self.pending.pop(msg["id"], None)
+                if w:
+                    w["resp"] = msg
+                    w["ev"].set()
+                continue
+            if "id" in msg and "method" in msg:
+                # Server->client request (approvals). Lanes run full-access with
+                # approvalPolicy never; accept anything that still arrives.
+                self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"],
+                                                  "result": {"decision": "accept"}}) + "\n")
+                self.proc.stdin.flush()
+                self.note(f"auto-accepted server request {msg['method']}")
+                continue
+            self.on_notification(msg.get("method"), msg.get("params") or {})
+        self.state["status"] = "exited"
+        self.save()
+        self.note("app-server exited")
+        os._exit(0)
+
+    def on_notification(self, method, params):
+        if method in ("item/agentMessage/delta", "turn/diff/updated", "item/commandExecution/outputDelta"):
+            if method == "item/agentMessage/delta":
+                self.agent_text += params.get("delta", "")
+            return
+        self.events.write(json.dumps({"t": time.time(), "method": method, "params": params})[:20000] + "\n")
+        self.events.flush()
+        # Codex lanes spawn sub-agent threads on the same app-server. Their turn
+        # and message events must not flip the lane's own status or overwrite
+        # its last message, or a working lane reads as idle (seen 2026-09-19).
+        foreign = params.get("threadId") not in (None, self.state.get("thread_id"))
+        if foreign and method in ("turn/started", "turn/completed", "item/completed"):
+            if method != "item/completed":
+                self.note(f"sub-agent {method} thread={params.get('threadId')}")
+            return
+        if method == "turn/started":
+            self.state.update(turn_id=params.get("turn", {}).get("id"), status="running")
+            self.state["turns"] += 1
+            self.agent_text = ""
+            self.note(f"turn started {self.state['turn_id']}")
+        elif method == "turn/completed":
+            turn = params.get("turn", {})
+            self.state.update(status="idle", turn_id=None, last_turn_status=turn.get("status"))
+            self.note(f"turn completed status={turn.get('status')}")
+        elif method == "item/completed":
+            item = params.get("item", {})
+            kind = item.get("type")
+            if kind == "agentMessage" and item.get("text"):
+                with open(self.p["last"], "w") as f:
+                    f.write(item["text"])
+                self.note("agent: " + item["text"][:400].replace("\n", " "))
+            elif kind == "commandExecution":
+                self.note(f"cmd exit={item.get('exitCode')}: {str(item.get('command'))[:200]}")
+        elif method == "error":
+            self.note("error: " + json.dumps(params)[:500])
+        self.save()
+
+    def control(self):
+        if os.path.exists(self.p["sock"]):
+            os.unlink(self.p["sock"])
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.p["sock"])
+        srv.listen(4)
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                try:
+                    cmd = json.loads(data)
+                    reply = self.handle(cmd)
+                except Exception as e:  # report to the CLI caller, keep serving
+                    reply = {"ok": False, "error": str(e)}
+                conn.sendall((json.dumps(reply) + "\n").encode())
+
+    def handle(self, cmd):
+        tid = self.state["thread_id"]
+        if cmd["op"] == "steer":
+            # A lane that has not reported turn/started yet is still spinning up
+            # (MCP servers, session load); wait briefly so an early steer joins
+            # the first turn instead of starting a second one.
+            for _ in range(60):
+                if self.state["status"] != "starting":
+                    break
+                time.sleep(1)
+            if self.state["status"] == "running" and self.state["turn_id"]:
+                self.send("turn/steer", {"threadId": tid, "expectedTurnId": self.state["turn_id"],
+                                         "input": text_input(cmd["text"])})
+                self.note("steered: " + cmd["text"][:300].replace("\n", " "))
+                return {"ok": True, "mode": "steer"}
+            # `turn/start` only answers when the turn ENDS, so never wait on it
+            # from the control socket: the caller would block for the whole turn.
+            threading.Thread(target=self.send, args=("turn/start", {"threadId": tid,
+                                                                    "input": text_input(cmd["text"])}),
+                             daemon=True).start()
+            self.note("follow-up turn: " + cmd["text"][:300].replace("\n", " "))
+            return {"ok": True, "mode": "followup"}
+        if cmd["op"] == "interrupt":
+            if self.state["turn_id"]:
+                self.send("turn/interrupt", {"threadId": tid, "turnId": self.state["turn_id"]})
+            return {"ok": True}
+        if cmd["op"] == "stop":
+            self.proc.terminate()
+            threading.Timer(1, lambda: os._exit(0)).start()
+            return {"ok": True}
+        return {"ok": False, "error": "unknown op"}
+
+    def run(self):
+        threading.Thread(target=self.reader, daemon=True).start()
+        self.send("initialize", {"clientInfo": {"name": "codex-lane", "version": "1"}})
+        self.send("initialized", {}, notify=True)
+        common = {"cwd": self.cwd,
+                  "sandbox": "danger-full-access", "approvalPolicy": "never"}
+        if self.model:
+            common["model"] = self.model
+        # Resume keeps the thread's whole transcript, so a follow-up brief can
+        # say "now also do X" without re-explaining the lane.
+        res = (self.send("thread/resume", {"threadId": self.resume_thread, "excludeTurns": True} | common)
+               if self.resume_thread else self.send("thread/start", common))
+        self.state["thread_id"] = res["thread"]["id"]
+        self.save()
+        self.note(f"thread {self.state['thread_id']} in {self.cwd}")
+        # Bind the control socket BEFORE the first turn: `turn/start` only
+        # answers when the turn ends, so waiting on it here would leave the lane
+        # unsteerable for its whole first turn — the exact thing this exists for.
+        with open(self.brief) as f:
+            brief = PREAMBLE + f.read()
+        threading.Thread(target=self.send, args=("turn/start", {"threadId": self.state["thread_id"],
+                                                                "input": text_input(brief)}),
+                         daemon=True).start()
+        self.control()
+
+
+def call(name, cmd):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(paths(name)["sock"])
+    s.sendall((json.dumps(cmd) + "\n").encode())
+    out = b""
+    while not out.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        out += chunk
+    return json.loads(out)
+
+
+def watch(names, heartbeat=0):
+    """Stream lane events as one line each, for Claude Code's Monitor tool.
+
+    Every stdout line becomes a chat notification, so this prints only what the
+    orchestrator acts on: turn end, errors, failed
+    commands, supervisor exit, new commits. Optional status line every
+    `heartbeat` seconds (off by default: each line costs a full orchestrator turn).
+    Lanes that start after the watch begins are picked up on the next scan.
+    """
+    offsets, heads, last_beat = {}, {}, time.time()
+
+    def lanes():
+        found = sorted(f[:-4] for f in os.listdir(DIR) if f.endswith(".log"))
+        return [n for n in found if not names or n in names]
+
+    def interesting(line):
+        body = line.split("] ", 1)[-1]
+        # Every printed line wakes the orchestrator for a full turn, so only print what it must act on:
+        # a finished turn (then read `last`), errors, and supervisor exit. Lane chatter stays in the log.
+        if body.startswith(("turn completed", "error: ", "app-server exited")):
+            return body
+        # Failed commands only; successful ones are noise at this altitude.
+        if body.startswith("cmd exit=") and not body.startswith(("cmd exit=0:", "cmd exit=None:")):
+            return body
+        return None
+
+    # Start at the end of existing logs: history is readable with `last`.
+    for n in lanes():
+        offsets[n] = os.path.getsize(paths(n)["log"])
+    while True:
+        for n in lanes():
+            p = paths(n)["log"]
+            size = os.path.getsize(p)
+            if size < offsets.get(n, 0):
+                offsets[n] = 0
+            if size > offsets.get(n, 0):
+                with open(p) as f:
+                    f.seek(offsets.get(n, 0))
+                    chunk = f.read()
+                    offsets[n] = f.tell()
+                for line in chunk.splitlines():
+                    msg = interesting(line)
+                    if msg:
+                        print(f"[{n}] {msg[:300]}", flush=True)
+            # New commits in a live lane's worktree are the other signal worth a ping.
+            st = read_state(n) or {}
+            cwd = st.get("cwd")
+            if cwd and os.path.exists(f"/proc/{st.get('pid')}") and os.path.exists(os.path.join(cwd, ".git")):
+                head = subprocess.run(["git", "-C", cwd, "log", "-1", "--format=%h %s"],
+                                      capture_output=True, text=True, timeout=20).stdout.strip()
+                if n in heads and head and head != heads[n]:
+                    print(f"[{n}] commit {head[:200]}", flush=True)
+                heads[n] = head
+        if heartbeat and time.time() - last_beat >= heartbeat:
+            last_beat = time.time()
+            live = []
+            for n in lanes():
+                st = read_state(n) or {}
+                if os.path.exists(f"/proc/{st.get('pid')}"):
+                    live.append(f"{n}={st.get('status')}/t{st.get('turns')}/{worktree_age(st.get('cwd'))}")
+            print("status " + (" ".join(live) if live else "no live lanes"), flush=True)
+        time.sleep(2)
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("--help", "-h"):
+        print(__doc__); return
+    os.makedirs(DIR, exist_ok=True)
+    op = a[0]
+    if op in ("start", "resume"):
+        resume_thread = a.pop(2) if op == "resume" else None
+        name, cwd, brief = a[1], os.path.abspath(a[2]), os.path.abspath(a[3])
+        model = a[a.index("--model") + 1] if "--model" in a else DEFAULT_MODEL
+        st = read_state(name)
+        if st and st.get("status") not in ("exited", None) and os.path.exists(f"/proc/{st['pid']}"):
+            sys.exit(f"lane {name} already running (pid {st['pid']})")
+        if os.fork():
+            time.sleep(4)
+            print(json.dumps(read_state(name)))
+            return
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        Supervisor(name, cwd, brief, model, resume_thread).run()
+    elif op == "steer":
+        text = a[2]
+        if text.startswith("@"):
+            text = open(text[1:]).read()
+        print(json.dumps(call(a[1], {"op": "steer", "text": text})))
+    elif op in ("interrupt", "stop"):
+        print(json.dumps(call(a[1], {"op": op})))
+    elif op == "status":
+        names = [a[1]] if len(a) > 1 else sorted(f[:-11] for f in os.listdir(DIR) if f.endswith(".state.json"))
+        for n in names:
+            st = read_state(n) or {}
+            alive = os.path.exists(f"/proc/{st.get('pid')}")
+            # The app-server does not always deliver turn notifications, so
+            # `status`/`turns` can sit at "starting 0" while the lane works.
+            # The worktree is the ground truth: show how recently it changed.
+            print(f"{n:28} {st.get('status','?'):8} alive={alive} turns={st.get('turns')} "
+                  f"worktree_changed={worktree_age(st.get('cwd'))} cwd={st.get('cwd')}")
+    elif op == "watch":
+        watch(set(a[1:]))
+    elif op == "last":
+        p = paths(a[1])["last"]
+        print(open(p).read() if os.path.exists(p) else "(no agent message yet)")
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()
