@@ -1,6 +1,6 @@
 # codex-lane
 
-*Grab the steering wheel while the agent is still driving.*
+Steer a Codex agent in the middle of its turn.
 
 Run a Codex agent as a long-lived lane that you can steer while a turn is still running, from a shell or from another agent such as Claude Code.
 
