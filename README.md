@@ -4,7 +4,7 @@ Steer a Codex agent in the middle of its turn.
 
 `codex exec` runs one prompt to the end, so a wrong assumption in the brief costs the whole run. A lane keeps one `codex app-server` alive behind a small supervisor. `steer` adds to the turn that is running, or starts the next turn on the same thread when the lane is idle. Works from a shell or from another agent such as Claude Code.
 
-![codex-lane --help listing the lane commands, with steer highlighted](docs/media/hero.gif)
+![Explainer: codex-lane start launches a supervisor and codex app-server; a steer during turn 1 travels over review.sock and becomes turn/steer inside the running turn; a steer on the idle lane becomes turn/start for turn 2 on the same thread; codex-lane stop ends it](docs/media/hero.gif)
 
 ## Install
 
